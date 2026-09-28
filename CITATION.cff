@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use SegWorkbench in your research, please cite our SERA 2026 paper."
+
+title: "SegWorkbench: A Unified Framework for Deep Learning-Based and Interactive Image Segmentation"
+
+authors:
+  - family-names: "Dhital"
+    given-names: "Damodar"
+
+  - family-names: "Pokhrel"
+    given-names: "Abishek"
+
+  - family-names: "Ashu"
+    given-names: "Favour"
+
+  - family-names: "Darm"
+    given-names: "Vir Chuy"
+
+  - family-names: "Qiao"
+    given-names: "Guanda"
+
+  - family-names: "Zhang"
+    given-names: "Lei"
+
+doi: "10.1109/SERA69989.2026.11618632"
+date-released: 2026
