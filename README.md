@@ -34,6 +34,21 @@ Features
 -Manual mask refinement
 -Training loss visualization
 
+## Citation
+
+If you use SegWorkbench in your research, please cite our paper:
+
+```bibtex
+@inproceedings{dhital2026segworkbench,
+  title={SegWorkbench: A Unified Framework for Deep Learning-Based and Interactive Image Segmentation},
+  author={Dhital, Damodar and Pokhrel, Abishek and Ashu, Favour and Darm, Vir Chuy and Qiao, Guanda and Zhang, Lei},
+  booktitle={2026 IEEE/ACIS 24th International Conference on Software Engineering Research, Management and Applications (SERA)},
+  pages={231--236},
+  year={2026},
+  publisher={IEEE},
+  doi={10.1109/SERA69989.2026.11618632}
+}
+
 Authors:
 Damodar Dhital
 Towson University
