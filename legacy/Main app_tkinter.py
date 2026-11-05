@@ -11,7 +11,7 @@ try:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
-    from torch.utils.data import Dataset, DataLoader
+    from torch.utils.data import Dataset, DataLoader, random_split
     import torchvision.transforms as T
 except Exception:
     torch = None
@@ -54,83 +54,7 @@ APP_TITLE = "Segmentation Suite — 4 Tabs (Training • Inference • GMM • M
 # Shared UNet implementation
 # -----------------------------
 if torch is not None:
-    class DoubleConv(nn.Module):
-        def __init__(self, in_channels, out_channels):
-            super().__init__()
-            self.double_conv = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-                nn.BatchNorm2d(out_channels),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-                nn.BatchNorm2d(out_channels),
-                nn.ReLU(inplace=True),
-            )
-
-        def forward(self, x):
-            return self.double_conv(x)
-
-    class Down(nn.Module):
-        def __init__(self, in_channels, out_channels):
-            super().__init__()
-            self.maxpool_conv = nn.Sequential(
-                nn.MaxPool2d(2),
-                DoubleConv(in_channels, out_channels),
-            )
-
-        def forward(self, x):
-            return self.maxpool_conv(x)
-
-    class Up(nn.Module):
-        def __init__(self, in_channels, out_channels, bilinear=True):
-            super().__init__()
-            if bilinear:
-                self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
-            else:
-                self.up = nn.ConvTranspose2d(in_channels // 2, in_channels // 2, kernel_size=2, stride=2)
-            self.conv = DoubleConv(in_channels, out_channels)
-
-        def forward(self, x1, x2):
-            x1 = self.up(x1)
-            diffY = x2.size()[2] - x1.size()[2]
-            diffX = x2.size()[3] - x1.size()[3]
-            x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
-            x = torch.cat([x2, x1], dim=1)
-            return self.conv(x)
-
-    class OutConv(nn.Module):
-        def __init__(self, in_channels, out_channels):
-            super().__init__()
-            self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-
-        def forward(self, x):
-            return self.conv(x)
-
-    class UNet(nn.Module):
-        def __init__(self, n_channels=3, n_classes=1, bilinear=True):
-            super().__init__()
-            self.inc = DoubleConv(n_channels, 32)
-            self.down1 = Down(32, 64)
-            self.down2 = Down(64, 128)
-            self.down3 = Down(128, 256)
-            self.down4 = Down(256, 256)
-            self.up1 = Up(512, 128, bilinear)
-            self.up2 = Up(256, 64, bilinear)
-            self.up3 = Up(128, 32, bilinear)
-            self.up4 = Up(64, 32, bilinear)
-            self.outc = OutConv(32, n_classes)
-
-        def forward(self, x):
-            x1 = self.inc(x)
-            x2 = self.down1(x1)
-            x3 = self.down2(x2)
-            x4 = self.down3(x3)
-            x5 = self.down4(x4)
-            x = self.up1(x5, x4)
-            x = self.up2(x, x3)
-            x = self.up3(x, x2)
-            x = self.up4(x, x1)
-            logits = self.outc(x)
-            return logits
+    from segworkbench.models.unet import UNet
 
 
 # -----------------------------
@@ -216,12 +140,14 @@ class TrainingTab(ttk.Frame):
         self.ax1 = fig.add_subplot(111)
         self.ax1.set_xlabel("Epoch")
         self.ax1.set_ylabel("Loss")
-        self.line_loss, = self.ax1.plot([], [], label="Loss")
+        self.line_loss, = self.ax1.plot([], [], label="Train Loss")
+        self.line_val_loss, = self.ax1.plot([], [], label="Val Loss")
         self.ax1.legend(loc="upper right")
         self.canvas = FigureCanvasTkAgg(fig, master=self)
         self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=10)
 
         self.losses = []
+        self.val_losses = []
 
     # --- thread-safe UI helper ---
     def ui(self, fn, *args, **kwargs):
@@ -312,21 +238,39 @@ class TrainingTab(ttk.Frame):
                 self.ui(self.status.set, "Idle")
                 return
 
-            loader = DataLoader(dataset, batch_size=self.batch_size.get(), shuffle=True, num_workers=0)
+            # Split into train / validation (80/20)
+            val_ratio = 0.2
+            val_size = int(len(dataset) * val_ratio)
+            train_size = len(dataset) - val_size
+            if val_size == 0:
+                val_size = 1
+                train_size = len(dataset) - 1
+            if train_size <= 0:
+                self.ui(err_dialog, "Training", "Not enough data for train/val split (need >1 sample).")
+                self.ui(self.status.set, "Idle")
+                return
+
+            train_ds, val_ds = random_split(dataset, [train_size, val_size])
+            train_loader = DataLoader(train_ds, batch_size=self.batch_size.get(), shuffle=True, num_workers=0)
+            val_loader = DataLoader(val_ds, batch_size=self.batch_size.get(), shuffle=False, num_workers=0)
+
             model = UNet(n_channels=3, n_classes=1).to(self.device)
             opt = torch.optim.AdamW(model.parameters(), lr=float(self.lr.get()))
             criterion = nn.BCEWithLogitsLoss()
 
+            best_val_loss = float("inf")
+            best_model_state = None
             total_epochs = int(self.epochs.get())
             for epoch in range(1, total_epochs + 1):
                 if self.stop_flag.is_set():
                     break
 
+                # Training
                 model.train()
                 ep_loss = 0.0
                 nb = 0
 
-                for imgs, msks in loader:
+                for imgs, msks in train_loader:
                     while self.pause_flag.is_set() and not self.stop_flag.is_set():
                         time.sleep(0.1)
                     if self.stop_flag.is_set():
@@ -344,27 +288,49 @@ class TrainingTab(ttk.Frame):
                     ep_loss += float(loss.item())
                     nb += 1
 
-                if nb > 0:
-                    self.losses.append(ep_loss / nb)
+                avg_train_loss = ep_loss / nb if nb > 0 else 0.0
+                self.losses.append(avg_train_loss)
+
+                # Validation
+                model.eval()
+                val_loss = 0.0
+                val_nb = 0
+                with torch.no_grad():
+                    for imgs, msks in val_loader:
+                        imgs = imgs.to(self.device)
+                        msks = msks.to(self.device)
+                        out = model(imgs)
+                        loss = criterion(out, msks)
+                        val_loss += float(loss.item())
+                        val_nb += 1
+
+                avg_val_loss = val_loss / val_nb if val_nb > 0 else 0.0
+                self.val_losses.append(avg_val_loss)
+
+                if avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
+                    best_model_state = model.state_dict().copy()
 
                 # Update plot + status from main thread
-                def _update_ui(epoch=epoch, total_epochs=total_epochs):
+                def _update_ui(epoch=epoch, total_epochs=total_epochs, tr=avg_train_loss, vl=avg_val_loss):
                     xs = list(range(1, len(self.losses) + 1))
                     self.line_loss.set_data(xs, self.losses)
+                    self.line_val_loss.set_data(xs, self.val_losses)
                     self.ax1.relim()
                     self.ax1.autoscale_view()
                     self.canvas.draw_idle()
-                    last = self.losses[-1] if self.losses else 0.0
-                    self.status.set(f"Epoch {epoch}/{total_epochs} | Loss: {last:.4f}")
+                    self.status.set(f"Epoch {epoch}/{total_epochs} | Train Loss: {tr:.4f} | Val Loss: {vl:.4f}")
 
                 self.ui(_update_ui)
 
-            # Save if not stopped
+            # Save best model if not stopped
             if not self.stop_flag.is_set():
+                if best_model_state is not None:
+                    model.load_state_dict(best_model_state)
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                outp = os.path.join(self.save_dir.get(), f"{ts}_unet_final.pth")
+                outp = os.path.join(self.save_dir.get(), f"{ts}_unet_best_val.pth")
                 torch.save(model.state_dict(), outp)
-                self.ui(info_dialog, "Training", f"Training complete. Model saved:\n{outp}")
+                self.ui(info_dialog, "Training", f"Training complete. Best val loss: {best_val_loss:.4f}\nModel saved:\n{outp}")
 
         except Exception as e:
             self.ui(err_dialog, "Training Error", str(e))
