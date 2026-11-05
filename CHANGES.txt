@@ -1,0 +1,571 @@
+================================================================================
+SegWorkbench Improvement Log
+================================================================================
+Date: 2024-10-29
+Tasks: Deduplicate UNet model + Fix validation split in training
+
+--------------------------------------------------------------------------------
+1. DEDUPLICATION: Centralized UNet Model
+--------------------------------------------------------------------------------
+
+PROBLEM:
+The UNet neural network architecture (DoubleConv, Down, Up, OutConv, UNet) was
+copy-pasted into 5 different Python files. Combined_Segmentation_Tool.py even
+had TWO identical copies inside the same file. This meant any bug fix or
+architecture tweak had to be made in 6 places.
+
+FILES CREATED:
+  segworkbench/__init__.py
+  segworkbench/models/__init__.py
+  segworkbench/models/unet.py
+
+SOLUTION:
+Moved the single canonical UNet implementation into:
+  segworkbench/models/unet.py
+
+All other scripts now import it with:
+  from segworkbench.models.unet import UNet
+
+FILES MODIFIED:
+  Main app.py
+    - Removed inline UNet definition (~85 lines)
+    - Added import inside the existing `if torch is not None:` guard
+
+  Combined app interface.py
+    - Removed inline UNet definition (~85 lines)
+    - Added import inside the existing `if torch is not None:` guard
+
+  Segmentation.py
+    - Removed inline UNet definition (~88 lines)
+    - Added import at module level
+
+  Unet_seg_model_training.py
+    - Removed inline UNet definition (~88 lines)
+    - Added import at module level
+
+  Combined_Segmentation_Tool.py
+    - Removed FIRST inline UNet definition (~88 lines)
+    - Removed SECOND inline UNet definition (~88 lines)
+    - Added two import statements (one for each former location)
+
+VERIFICATION:
+  $ grep -n "class UNet" *.py
+  -> No more inline UNet classes remain (only `class UNetTrainingTool` GUI
+     wrappers, which are intentionally separate).
+
+  $ grep -n "from segworkbench.models.unet import UNet" *.py
+  -> Imports present in all 5 affected files.
+
+--------------------------------------------------------------------------------
+2. FIX: Real Train/Validation Split in Main app.py
+--------------------------------------------------------------------------------
+
+PROBLEM:
+The TrainingTab in Main app.py used the ENTIRE dataset for training and had
+no validation set. It trained for N epochs and blindly saved the model from the
+last epoch, even if the model had started overfitting earlier. The loss plot
+only showed training loss, giving users no signal about generalization.
+
+SOLUTION:
+Rewrote `_train_loop()` in Main app.py to perform an 80/20 train/validation
+split using PyTorch's `random_split`.
+
+KEY CHANGES IN Main app.py:
+  a) Imports
+     - Added `random_split` to the `torch.utils.data` import line.
+
+  b) Plot initialization (TrainingTab.__init__)
+     - Added a second plot line: `self.line_val_loss`
+     - Renamed legend labels from "Loss" -> "Train Loss" / "Val Loss"
+     - Added `self.val_losses = []` list to store validation loss history.
+
+  c) _train_loop() logic
+     - Splits dataset with 20% held out for validation.
+     - Falls back gracefully for tiny datasets (ensures at least 1 validation
+       sample and errors out if < 2 total samples).
+     - Creates separate `train_loader` and `val_loader`.
+     - Tracks `best_val_loss` and `best_model_state` across epochs.
+     - Runs a validation pass in `eval()` mode with `torch.no_grad()` after
+       each training epoch.
+     - Updates the GUI status bar with BOTH losses each epoch.
+     - Updates the loss plot with BOTH curves each epoch.
+     - At the end of training, restores and saves the model with the LOWEST
+       validation loss (filename: `*_unet_best_val.pth`), NOT just the final
+       epoch model.
+
+BEFORE:
+  Epoch 5/20 | Loss: 0.1234
+  -> Saves final epoch weights regardless of quality.
+
+AFTER:
+  Epoch 5/20 | Train Loss: 0.1234 | Val Loss: 0.1456
+  -> Saves the model from the epoch with the best validation loss.
+
+--------------------------------------------------------------------------------
+3. KNOWN LIMITATIONS / FUTURE WORK
+--------------------------------------------------------------------------------
+
+  - The other training script (Unet_seg_model_training.py) still uses training
+    loss as its "val_loss" for early stopping. That was NOT changed in this
+    pass; only Main app.py was fixed.
+  - No data augmentation was added (rotation, flips, etc.).
+  - Image size (256) is still hardcoded in several places.
+  - There is still no requirements.txt or .gitignore.
+
+--------------------------------------------------------------------------------
+4. TESTING RECOMMENDATION
+--------------------------------------------------------------------------------
+
+Before running the app, verify the new package is importable:
+
+  $ python -c "from segworkbench.models.unet import UNet; print('OK')"
+
+Then launch the main app:
+
+  $ python "Main app.py"
+
+Go to Tab 1 (Training), select image/mask folders, and start training. You
+should now see two curves (blue = Train, orange = Val) and the status bar
+should display both loss values each epoch.
+
+================================================================================
+SegWorkbench Improvement Log
+================================================================================
+Date: 2024-11-04
+Tasks: Complete GUI migration from tkinter to PySide6 (Phases 1–7)
+
+--------------------------------------------------------------------------------
+1. OVERVIEW: Tkinter → PySide6 Migration
+--------------------------------------------------------------------------------
+
+PROBLEM:
+The entire application lived in a single ~1,200-line tkinter script
+(Main app.py). tkinter is outdated, hard to theme, and lacks high-performance
+interactive widgets (e.g., zoomable image canvases). The monolithic file
+mixed GUI code, training loops, inference logic, GMM analysis, and mask editing
+geometry, making maintenance difficult.
+
+SOLUTION:
+Replaced the tkinter GUI with a modern PySide6 (Qt for Python) application.
+Split the monolith into a clean package structure:
+
+  • segworkbench/engine/     — Training & inference back-ends
+  • segworkbench/utils/      — Image processing helpers
+  • segworkbench/analysis/   — GMM / threshold algorithms
+  • segworkbench/editor/     — Mask editing geometry & undo stack
+  • segworkbench/gui/        — Qt tabs, widgets, stylesheets
+  • segworkbench/configs/    — Model + application settings
+
+The old script was renamed to "Main app_tkinter.py" for reference.
+New entry points are:
+
+    python main.py
+    python -m segworkbench
+
+--------------------------------------------------------------------------------
+2. PHASE 1 — Structural Refactoring (Engine & Utilities)
+--------------------------------------------------------------------------------
+
+FILES CREATED:
+  segworkbench/engine/__init__.py
+  segworkbench/engine/trainer.py
+      - SegDataset (pytorch Dataset for paired images/masks)
+      - Trainer class with callback-based progress reporting
+      - Pause / stop via threading.Event
+      - Preserves train/validation split logic from the tkinter version
+
+  segworkbench/engine/inferencer.py
+      - Inferencer class for batch inference
+      - Progress callbacks and cooperative cancellation
+
+  segworkbench/utils/__init__.py
+  segworkbench/utils/image_utils.py
+      - crop_to_content() (used by inference and editor)
+
+  segworkbench/analysis/__init__.py
+  segworkbench/analysis/gmm_segmenter.py
+      - GMMSegmenter class: image loading, GMM fitting, threshold methods
+      - Methods: GMM, Otsu, Triangle, IsoData
+      - Decoupled from plotting — returns raw histogram / curve data
+
+  segworkbench/editor/__init__.py
+  segworkbench/editor/mask_ops.py
+      - MaskBuffer: uint8 mask array + undo stack (LIFO, max 20)
+      - draw_circle() and draw_line_circles() NumPy primitives
+
+  segworkbench/configs/app_config.py
+      - AppConfig dataclass for recent folders, window geometry, theme
+      - Auto-saves to user config directory (~/.config/segworkbench/)
+
+FILES MODIFIED:
+  requirements.txt
+      + pyside6>=6.6.0
+
+--------------------------------------------------------------------------------
+3. PHASE 2 — Qt Application Shell
+--------------------------------------------------------------------------------
+
+FILES CREATED:
+  segworkbench/__main__.py
+      Entry point: python -m segworkbench
+
+  segworkbench/gui/__init__.py
+  segworkbench/gui/app.py
+      MainWindow (QMainWindow)
+        - QTabWidget with 4 tabs (stubs at this stage)
+        - Menu bar: File → Exit (Ctrl+Q), Help → About
+        - Status bar
+        - F11 / Escape fullscreen toggles
+        - apply_theme() loads dark.qss
+
+  segworkbench/gui/base_tab.py
+      BaseTab (QWidget)
+        - show_info(), show_error(), ask_directory(), ask_open_file(),
+          ask_save_file()
+        - safe_call() — marshals callbacks to the GUI thread via pyqtSignal
+          so worker threads never touch Qt widgets directly
+
+  segworkbench/gui/widgets/__init__.py
+  segworkbench/gui/widgets/mpl_canvas.py
+      MplCanvas — thin wrapper around matplotlib's FigureCanvasQTAgg
+
+  segworkbench/gui/tabs/__init__.py
+      Imports for all 4 tabs (stubs)
+
+  segworkbench/gui/styles/dark.qss
+      Dark Qt stylesheet matching the original #1e1e1e canvas aesthetic
+
+FILES CREATED:
+  main.py
+      Alternate entry point at project root: python main.py
+
+--------------------------------------------------------------------------------
+4. PHASE 3 — Training Tab
+--------------------------------------------------------------------------------
+
+FILE CREATED / REPLACED:
+  segworkbench/gui/tabs/training_tab.py
+
+FEATURES:
+  - Dataset paths: Images, Masks, Save-folder (QLineEdit + Browse buttons)
+  - Hyperparameters: Epochs (QSpinBox), Batch Size (QSpinBox),
+    Learning Rate (QDoubleSpinBox with 6 decimals)
+  - Action buttons: Start Training, Pause, Resume, Stop
+  - Live matplotlib loss plot (two curves: Train / Val)
+  - Thread-safe: Training runs in a daemon threading.Thread.
+    Epoch callbacks use BaseTab.safe_call() to update the plot and status
+    label from the main thread.
+  - Best validation-state model is saved with a timestamped filename.
+
+--------------------------------------------------------------------------------
+5. PHASE 4 — Inference Tab
+--------------------------------------------------------------------------------
+
+FILE CREATED / REPLACED:
+  segworkbench/gui/tabs/inference_tab.py
+
+FEATURES:
+  - Model (.pth), Input folder, Output folder selectors
+  - Output format QComboBox: .png / .tif
+  - Start / Stop buttons
+  - Status label shows "Processed N/M: filename"
+  - Completion dialog reports duration and output directory
+  - Cooperative cancellation via threading.Event
+
+--------------------------------------------------------------------------------
+6. PHASE 5 — GMM Tab
+--------------------------------------------------------------------------------
+
+FILE CREATED / REPLACED:
+  segworkbench/gui/tabs/gmm_tab.py
+
+FEATURES:
+  - Open Image browse button with image file filter
+  - Left canvas: shows current image or resulting binary mask
+  - Right canvas: histogram bars + GMM component pdf curves + threshold line
+  - Gaussian count QSpinBox (1–9) — refits GMM on change
+  - Threshold method QRadioButton group: GMM, Otsu, Triangle, IsoData
+  - Threshold slider mapped proportionally across actual pixel range
+    (avoids Qt integer-only limitation)
+  - Apply Segmentation button generates and displays the binary mask
+  - Green dashed line marks the current threshold on the histogram
+
+--------------------------------------------------------------------------------
+7. PHASE 6 — Mask Editor Tab (Highest Complexity)
+--------------------------------------------------------------------------------
+
+FILE CREATED / REPLACED:
+  segworkbench/gui/tabs/mask_editor_tab.py
+
+FEATURES:
+  - QGraphicsView + QGraphicsScene replaces tkinter Canvas
+  - Background image via QGraphicsPixmapItem
+  - Overlay pixmap: red fill (configurable opacity) + green edge outline
+  - Brush / Eraser modes with zoom-adaptive radius
+  - Mouse-wheel zoom (0.25x–4.0x) centred on cursor
+  - Fit-to-window button
+  - Undo (Ctrl+Z) with max-20 stack
+  - Brush cursor drawn as a green ellipse that scales with zoom
+  - Load image + optional mask, New Blank Mask, Clear Mask
+  - Save Mask PNG (Ctrl+S) and Save Transparent PNG (Ctrl+Shift+S)
+  - Status label shows mask pixel count and percentage
+
+KEY DESIGN CHOICES:
+  - Editing is performed on the full-resolution MaskBuffer array.
+    Only the overlay pixmap is regenerated for display, preserving stroke
+    quality at any zoom level.
+  - The left/right mouse coordinate mapping uses the QGraphicsView scene
+    transform, replacing manual canvas offset calculations.
+
+--------------------------------------------------------------------------------
+8. PHASE 7 — Cleanup & Polish
+--------------------------------------------------------------------------------
+
+FILES RENAMED:
+  Main app.py → Main app_tkinter.py
+      The old tkinter script is preserved for reference but is no longer the
+      recommended entry point.
+
+FILES CREATED:
+  main.py
+      Standalone entry point: python main.py
+
+UI POLISH APPLIED:
+  - Menu bar added to MainWindow (File → Exit, Help → About)
+  - Keyboard shortcuts added:
+      F11          Toggle fullscreen
+      Escape       Exit fullscreen
+      Ctrl+O       Open image (Mask Editor)
+      Ctrl+S       Save mask PNG (Mask Editor)
+      Ctrl+Shift+S Save transparent PNG (Mask Editor)
+      Ctrl+Z       Undo (Mask Editor)
+      Ctrl+Q       Exit application
+  - Dark theme stylesheet (dark.qss) applied globally at startup
+  - All long-running operations wrapped in try/except with QMessageBox error
+    dialogs (already present in all tab implementations)
+
+--------------------------------------------------------------------------------
+9. FILES AFFECTED SUMMARY
+--------------------------------------------------------------------------------
+
+NEW MODULES (Phase 1 back-end):
+  segworkbench/engine/trainer.py
+  segworkbench/engine/inferencer.py
+  segworkbench/utils/image_utils.py
+  segworkbench/analysis/gmm_segmenter.py
+  segworkbench/editor/mask_ops.py
+  segworkbench/configs/app_config.py
+
+NEW GUI (Phase 2–6):
+  segworkbench/gui/app.py
+  segworkbench/gui/base_tab.py
+  segworkbench/gui/widgets/mpl_canvas.py
+  segworkbench/gui/tabs/training_tab.py
+  segworkbench/gui/tabs/inference_tab.py
+  segworkbench/gui/tabs/gmm_tab.py
+  segworkbench/gui/tabs/mask_editor_tab.py
+  segworkbench/gui/styles/dark.qss
+  segworkbench/__main__.py
+  main.py
+
+MODIFIED:
+  requirements.txt            (+ pyside6)
+  segworkbench/configs/__init__.py   (+ AppConfig export)
+  segworkbench/__init__.py    (no change)
+
+RENAMED:
+  Main app.py → Main app_tkinter.py
+
+--------------------------------------------------------------------------------
+10. KNOWN LIMITATIONS / FUTURE WORK
+--------------------------------------------------------------------------------
+
+  - The other standalone training script (Unet_seg_model_training.py) is still
+    a separate tkinter script in the project root and was not migrated.
+  - Packaging (PyInstaller / cx_Freeze) has not been configured yet.
+  - No unit tests yet for the new GUI widgets.
+  - QThread upgrade for training/inference workers was deferred; current
+    implementation uses Python threading.Thread + safe_call, which is stable
+    but slightly less integrated with Qt's event loop.
+
+--------------------------------------------------------------------------------
+11. TESTING RECOMMENDATION
+--------------------------------------------------------------------------------
+
+Verify the package imports cleanly:
+
+    $ python -c "from segworkbench.gui.app import MainWindow; print('OK')"
+
+Launch the new application:
+
+    $ python main.py
+    # or
+    $ python -m segworkbench
+
+Tab 1 (Training): Select image/mask folders, set epochs=2, click Start.
+   → Two loss curves should appear and update each epoch.
+
+Tab 2 (Inference): Choose a saved .pth, input folder, click Start.
+   → Segmented images should appear in the output folder.
+
+Tab 3 (GMM): Open a .tif image, adjust Gaussians / method, drag slider.
+   → Histogram should update with component curves and a green line.
+
+Tab 4 (Mask Editor): Open an image, draw with brush, zoom with wheel,
+   press Ctrl+Z to undo, then Ctrl+S to save.
+
+================================================================================
+SegWorkbench Improvement Log
+================================================================================
+Date: 2024-11-05
+Tasks: Category 3 (Architecture) + Category 4 (Performance/Robustness) + Category 5 (ML/Training) + Category 6 (Inference/I/O) + Hang Fix
+
+--------------------------------------------------------------------------------
+1. CODE ARCHITECTURE (Category 3)
+--------------------------------------------------------------------------------
+
+A) Deduplicated entry points
+   main.py is now a thin wrapper:
+       from segworkbench.__main__ import main
+   Previously it duplicated the entire QApplication bootstrap.
+
+B) ModelConfig / CheckpointManager wired into Trainer
+   Trainer.train() accepts an optional config: ModelConfig.
+   When provided, epochs / batch_size / lr / image_size / patience / min_delta
+   are read from the config, and CheckpointManager.save() is called on every
+   new best-validation epoch.
+
+C) QThread workers replaced threading.Thread
+   segworkbench/gui/workers.py (NEW)
+       TrainingWorker(QThread)  — runs Trainer.train()
+       InferenceWorker(QThread) — runs Inferencer.run()
+   Signals:
+       epoch_finished.emit(dict)   — {epoch, total, train_loss, val_loss, dice, iou}
+       training_finished.emit(dict, bool)
+       progress.emit(int, int, str)
+   Tabs connect directly to pyqtSignal instead of using safe_call() marshalling.
+
+D) Structured logging
+   Added logging.getLogger(__name__) to:
+       segworkbench/engine/trainer.py
+       segworkbench/engine/inferencer.py
+   Key events logged at INFO:
+       training start/finish, epoch summary, early stop, inference start/finish.
+
+--------------------------------------------------------------------------------
+2. PERFORMANCE & ROBUSTNESS (Category 4)
+--------------------------------------------------------------------------------
+
+A) Fixed QImage buffer lifetime crash
+   mask_editor_tab.py — both _render_overlay_pixmap and _pil_to_pixmap now call
+   .copy() after constructing QImage(...). This ensures Qt owns the pixel buffer
+   and prevents segfaults when the NumPy array is garbage-collected.
+
+B) Enabled weights_only=True in torch.load
+   configs/model_config.py  — CheckpointManager.load() and load_checkpoint()
+   engine/inferencer.py     — Inferencer.run()
+   Removes security warnings with untrusted checkpoints.
+
+C) Fixed batch-size bug in SegDataset
+   Changed T.Resize(256) → T.Resize((256, 256)) for both images and masks.
+   T.Resize(int) resizes the shorter edge, yielding variable dimensions that
+   break batch collation. T.Resize((int, int)) guarantees a fixed square output.
+
+D) Exposed num_workers
+   Trainer.train() accepts num_workers kwarg.
+   TrainingTab added a Workers spin-box (0–16, default 0).
+   Passed through to both train_loader and val_loader.
+
+E) CPU thread capping (hang fix)
+   When Trainer detects a CPU-only device, _limit_cpu_threads() caps
+   torch.set_num_threads(4). This prevents OpenMP from spawning one thread
+   per core and starving the Qt event loop, which previously caused the
+   entire system to hang on multi-core CPUs.
+
+--------------------------------------------------------------------------------
+3. MACHINE LEARNING / TRAINING (Category 5)
+--------------------------------------------------------------------------------
+
+A) Data augmentation
+   SegDataset._random_affine applies identical transforms to image + mask:
+       - Horizontal flip (p = 0.5)
+       - Vertical flip   (p = 0.5)
+       - Rotation        (uniform ±15°)
+   Enabled only for training data; validation subset uses augment=False.
+
+B) Segmentation metrics
+   Added _dice_score() and _iou_score() helpers.
+   Validation loop accumulates per-batch Dice and IoU and reports epoch averages.
+   TrainingTab now shows a second live matplotlib plot (Dice + IoU) side-by-side
+   with the loss plot.
+
+C) LR scheduler
+   torch.optim.lr_scheduler.ReduceLROnPlateau
+       mode="min", factor=0.5, patience=max(1, config.patience // 2)
+   Steps each epoch based on validation loss.
+
+D) Early stopping
+   Reads patience and min_delta from ModelConfig.
+   Counter increments when validation loss does not improve by min_delta.
+   Training halts when counter reaches patience.
+
+E) MPS support (Apple Silicon GPU)
+   _auto_device() now checks torch.backends.mps.is_available() between CUDA
+   and CPU fallback. Both Trainer and Inferencer use this helper.
+
+--------------------------------------------------------------------------------
+4. INFERENCE & I/O (Category 6)
+--------------------------------------------------------------------------------
+
+A) Original resolution restoration
+   Inferencer no longer saves 256×256 masks.
+   After model inference at the configured square size, the probability map is
+   upsampled back to the original (width, height) via F.interpolate() with
+   bilinear mode before thresholding.
+
+B) Configurable threshold
+   Added threshold kwarg to Inferencer.run() (default 0.5).
+   InferenceTab exposes a QDoubleSpinBox (0.00–1.00, step 0.05).
+
+C) 16-bit / grayscale support
+   Added preserve_depth kwarg to Inferencer.run().
+   InferenceTab exposes a QCheckBox "Preserve 16-bit depth".
+   When enabled, L / I / I;16 / F mode images are normalized directly without
+   forcing .convert("RGB"), preserving full dynamic range for scientific TIFFs.
+
+D) Configurable image_size
+   Inferencer.run() accepts image_size kwarg.
+   InferenceTab exposes a QSpinBox (64–2048, default 256).
+   Controls the model input crop; output is still restored to original resolution.
+
+--------------------------------------------------------------------------------
+5. FILES AFFECTED
+--------------------------------------------------------------------------------
+
+NEW:
+  segworkbench/gui/workers.py
+
+REWRITTEN:
+  main.py                          (thin wrapper)
+  segworkbench/gui/tabs/training_tab.py    (dual plots, workers spin-box, QThread)
+  segworkbench/gui/tabs/inference_tab.py   (options panel, QThread)
+  segworkbench/engine/trainer.py           (augmentation, metrics, scheduler, early stop, MPS)
+  segworkbench/engine/inferencer.py        (original res, threshold, 16-bit, MPS)
+
+MODIFIED:
+  segworkbench/gui/workers.py              (Signal(dict) for safety)
+  segworkbench/gui/tabs/mask_editor_tab.py (QImage .copy() fix)
+  segworkbench/configs/model_config.py     (weights_only=True)
+
+--------------------------------------------------------------------------------
+6. KNOWN LIMITATIONS / FUTURE WORK
+--------------------------------------------------------------------------------
+
+  - Unet_seg_model_training.py (tkinter) still exists in legacy/ and was not
+    migrated to PySide6.
+  - Packaging (PyInstaller / cx_Freeze) has not been configured yet.
+  - No unit tests yet for GUI widgets or engine modules.
+  - No pyproject.toml or packaging metadata.
+
+================================================================================
+
